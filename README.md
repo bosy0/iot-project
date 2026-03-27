@@ -48,3 +48,4 @@ pio device monitor
 - [bosy0](https://github.com/bosy0)
 - [RemRem-28](https://github.com/RemRem-28)
 - [mariusduperrier](https://github.com/mariusduperrier)
+- [alielazzouzi2005-del](https://github.com/alielazzouzi2005-del)
