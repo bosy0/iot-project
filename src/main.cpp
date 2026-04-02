@@ -18,14 +18,16 @@
 #include <TinyGPS++.h>
 #include "SHT3X.h"
 #include "QMP6988.h"
+#include <SD.h>
+#include <SPI.h>
 
 // ─── Configuration réseau ─────────────────────────────────────────────────────
-#define WIFI_SSID  "iPhone de Nathan"
-#define WIFI_PASS  "prout123"
-#define MQTT_HOST  "8d2786e137204467ae3306b4c65d8ba7.s1.eu.hivemq.cloud"
+#define WIFI_SSID  "Pixel 8a Marius"
+#define WIFI_PASS  "Mariusdup"
+#define MQTT_HOST  "632e64128d12456aa5bb05d63a8d5f49.s1.eu.hivemq.cloud"
 #define MQTT_PORT  8883
 #define MQTT_USER  "iot_project"
-#define MQTT_PASS  "9PXaSGq&Ju&im8"
+#define MQTT_PASS  "7%tWH4bUoN!Y3#gg7"
 #define DEVICE_ID  "m5stack_1"
 
 // ─── Couleurs ─────────────────────────────────────────────────────────────────
@@ -82,11 +84,20 @@ void drawContent();
 void drawPageAir();
 void drawPageEnv();
 void drawPageGPS();
+void drawPageNet();
 void setScreen(bool on);
 uint16_t qColor(float v, float good, float ok);
 void drawProgressBar(int x, int y, int w, int h, float ratio, uint16_t color);
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Constantes gestion connexion MQTT
+uint32_t mqttRetryDelay = 2000; // Délai initial 2s
+const uint32_t maxRetryDelay = 60000;
+
+// ─── Paramètres Carte SD ─────────────────────────────────────────────────────────
+bool sdAvailable = false;
+const char* bufferFile = "/buffer.json";
+
 
 void setup() {
     M5.begin();
@@ -98,6 +109,17 @@ void setup() {
 
     M5.Lcd.fillScreen(CLR_BG);
     M5.Lcd.setBrightness(150);
+
+    // Configuration MQTT (TLS sans vérification certificat pour la démo)
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+
+    // Initialisation de la carte SD
+    if (SD.begin()) {
+        sdAvailable = true;
+        Serial.println("Carte SD initialisée.");
+    } else {
+        Serial.println("Échec de l'initialisation de la carte SD.");
+    }
 
     // Écran de démarrage
     M5.Lcd.setTextDatum(MC_DATUM);
@@ -162,12 +184,12 @@ void loop() {
     }
     if (screenOn) {
         if (M5.BtnB.wasPressed()) {
-            page = (page + 2) % 3; // page précédente
+            page = (page + 3) % 4; // page précédente
             drawBtnBar();
             drawContent();
         }
         if (M5.BtnC.wasPressed()) {
-            page = (page + 1) % 3; // page suivante
+            page = (page + 1) % 4; // page suivante
             drawBtnBar();
             drawContent();
         }
@@ -225,35 +247,80 @@ void loop() {
 
     // ── MQTT ──────────────────────────────────────────────────────────────
     if (WiFi.isConnected()) {
-        if (!mqtt.connected() && now - tRecon >= 5000) {
-            tRecon = now;
-            mqtt.connect(DEVICE_ID, MQTT_USER, MQTT_PASS);
+
+       if (!mqtt.connected()) {
+            // On ne tente la reco que si le délai est passé
+            if (now - tRecon >= mqttRetryDelay) {
+                tRecon = now;
+                Serial.println("Tentative de connexion MQTT...");
+                
+                if (mqtt.connect(DEVICE_ID, MQTT_USER, MQTT_PASS)) {
+                    Serial.println("Connecté !");
+                    mqttRetryDelay = 2000; // Reset du délai en cas de succès
+                } else {
+                    Serial.print("Échec, code erreur : ");
+                    Serial.println(mqtt.state());
+                    // Augmentation exponentielle du délai (x2)
+                    mqttRetryDelay = min(mqttRetryDelay * 2, maxRetryDelay);
+                }
+            }
+        } else {
+            mqtt.loop(); // Traitement des messages entrant/sortant
         }
-        mqtt.loop();
+    } else {
+        // Si le WiFi est perdu, on reset le timer de reco MQTT
+        tRecon = now;
     }
-    if (now - tMqtt >= 10000) {
+    
+    if (mqtt.connected() && (now - tMqtt >= 10000)) {
         tMqtt = now;
+        char buf[512], topic[48];
+        snprintf(buf, sizeof(buf),
+            "{\"pm1\":%d,\"pm25\":%d,\"pm10\":%d,"
+            "\"voc\":%.1f,\"temp\":%.1f,\"humi\":%.1f,"
+            "\"pres\":%.1f,\"alt\":%.1f,"
+            "\"lat\":%.6f,\"lng\":%.6f,\"gps_alt\":%.1f,\"sats\":%d,"
+            "\"battery\":%d,\"charging\":%s}",
+            d.pm1, d.pm25, d.pm10,
+            d.voc, d.temp, d.humi, d.pres, d.alt,
+            d.gpsValid ? d.lat : 0.0,
+            d.gpsValid ? d.lng : 0.0,
+            d.gpsAlt, d.sats,
+            d.battery,
+            d.charging ? "true" : "false"
+        );
+
         if (mqtt.connected()) {
-            char buf[512], topic[48];
-            snprintf(buf, sizeof(buf),
-                "{\"pm1\":%d,\"pm25\":%d,\"pm10\":%d,"
-                "\"voc\":%.1f,\"temp\":%.1f,\"humi\":%.1f,"
-                "\"pres\":%.1f,\"alt\":%.1f,"
-                "\"lat\":%.6f,\"lng\":%.6f,\"gps_alt\":%.1f,\"sats\":%d,"
-                "\"battery\":%d,\"charging\":%s}",
-                d.pm1, d.pm25, d.pm10,
-                d.voc, d.temp, d.humi, d.pres, d.alt,
-                d.gpsValid ? d.lat : 0.0,
-                d.gpsValid ? d.lng : 0.0,
-                d.gpsAlt, d.sats,
-                d.battery,
-                d.charging ? "true" : "false"
-            );
+            if (SD.exists("/buffer.txt")) {
+                File file = SD.open("/buffer.txt", FILE_READ);
+                if (file) {
+                    while (file.available()) {
+                        String line = file.readStringUntil('\n');
+                        line.trim();
+                        if (line.length() > 0) {
+                            mqtt.publish(topic, line.c_str(), true);
+                            delay(50); // Petit délai pour laisser souffler le broker
+                        }
+                    }
+                    file.close();
+                    SD.remove("/buffer.txt"); // On a tout envoyé, on efface !
+                }
+            }
+            // 2. Envoi de la donnée en direct
             snprintf(topic, sizeof(topic), "sensors/%s/data", DEVICE_ID);
             mqtt.publish(topic, buf, true);
+            drawStatusBar();
+        } else if (sdAvailable) {
+            // 3. Pas de connexion => On stocke le JSON tel quel sur la SD
+            File file = SD.open("/buffer.txt", FILE_APPEND);
+            if (file) {
+                file.println(buf); // On écrit la ligne JSON
+                file.close();
+                drawStatusBar();
+            }
         }
     }
-}
+    }
 
 // ─── Écran on/off ────────────────────────────────────────────────────────────
 void setScreen(bool on) {
@@ -297,6 +364,16 @@ void drawStatusBar() {
                   WiFi.isConnected()  ? CLR_OK   : CLR_BAD;
     M5.Lcd.fillCircle(14, BAR_H / 2, 6, sc);
 
+    uint16_t sdColor = CLR_SEP; // Gris par défaut
+    if (sdAvailable) {
+        if (mqtt.connected()) {
+        sdColor = CLR_CYAN;
+    } else {
+        // Clignote toutes les 500ms si on écrit sur SD
+        sdColor = (millis() % 1000 < 500) ? CLR_BAD : CLR_BG;
+    }
+    }
+
     // Titre centré
     M5.Lcd.setTextDatum(MC_DATUM);
     M5.Lcd.setTextColor(WHITE, CLR_BAR);
@@ -318,7 +395,7 @@ void drawBtnBar() {
     M5.Lcd.fillRect(0, BTN_Y, 320, 240 - BTN_Y, CLR_BAR);
     M5.Lcd.drawFastHLine(0, BTN_Y, 320, CLR_SEP);
 
-    const char* names[] = {"Air", "Env", "GPS"};
+    const char* names[] = {"Air", "Env", "GPS", "Net"};
 
     // Bouton A : écran
     M5.Lcd.setTextColor(CLR_LABEL, CLR_BAR);
@@ -344,6 +421,7 @@ void drawContent() {
         case 0: drawPageAir(); break;
         case 1: drawPageEnv(); break;
         case 2: drawPageGPS(); break;
+        case 3: drawPageNet(); break;
     }
 }
 
@@ -514,6 +592,82 @@ void drawPageGPS() {
         if (i < 3)
             M5.Lcd.drawFastHLine(10, row_y + 38, 300, CLR_SEP);
 
+        row_y += 38;
+    }
+    M5.Lcd.setTextDatum(TL_DATUM);
+}
+
+// Page 3 — Statuts réseau & SD (WiFi, MQTT, carte SD, buffer)
+void drawPageNet() {
+    M5.Lcd.setTextDatum(TC_DATUM);
+    M5.Lcd.setTextColor(CLR_CYAN, CLR_BG);
+    M5.Lcd.drawString("STATUTS RESEAU & SD", 160, CONT_Y + 4, 2);
+
+    struct { const char* label; String value; uint16_t color; } netRows[4];
+
+    // --- Ligne 1 : WiFi ---
+    netRows[0].label = "WiFi (RSSI)";
+    if (WiFi.isConnected()) {
+        long rssi = WiFi.RSSI();
+        netRows[0].value = String(rssi) + " dBm";
+        netRows[0].color = (rssi > -70) ? CLR_GOOD : CLR_OK;
+    } else {
+        netRows[0].value = "DECONNECTE";
+        netRows[0].color = CLR_BAD;
+    }
+
+    // --- Ligne 2 : MQTT ---
+    netRows[1].label = "MQTT Cloud";
+    if (mqtt.connected()) {
+        netRows[1].value = "CONNECTE";
+        netRows[1].color = CLR_GOOD;
+    } else {
+        netRows[1].value = "ERREUR " + String(mqtt.state());
+        netRows[1].color = CLR_BAD;
+    }
+
+    // --- Ligne 3 : Carte SD ---
+    netRows[2].label = "Carte SD";
+    if (sdAvailable) {
+        uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+        netRows[2].value = String((unsigned long)cardSize) + " MB";
+        netRows[2].color = CLR_GOOD;
+    } else {
+        netRows[2].value = "ABSENTE";
+        netRows[2].color = CLR_SEP;
+    }
+
+    // --- Ligne 4 : Buffer ---
+    netRows[3].label = "Buffer SD";
+    if (sdAvailable) {
+        if (SD.exists("/buffer.txt")) {
+            File f = SD.open("/buffer.txt", FILE_READ);
+            long sz = f.size();
+            f.close();
+            netRows[3].value = String(sz / 1024) + " KB";
+            netRows[3].color = CLR_BAD; // Rouge car on accumule du retard
+        } else {
+            netRows[3].value = "VIDE (OK)";
+            netRows[3].color = CLR_GOOD;
+        }
+    } else {
+        netRows[3].value = "INACTIF";
+        netRows[3].color = CLR_SEP;
+    }
+
+    // Affichage des lignes
+    int row_y = CONT_Y + 28;
+    for (int i = 0; i < 4; i++) {
+        int mid = row_y + 19;
+        M5.Lcd.setTextColor(CLR_LABEL, CLR_BG);
+        M5.Lcd.setTextDatum(ML_DATUM);
+        M5.Lcd.drawString(netRows[i].label, 14, mid, 2);
+
+        M5.Lcd.setTextColor(netRows[i].color, CLR_BG);
+        M5.Lcd.setTextDatum(MR_DATUM);
+        M5.Lcd.drawString(netRows[i].value, 310, mid, 4);
+
+        if (i < 3) M5.Lcd.drawFastHLine(10, row_y + 38, 300, CLR_SEP);
         row_y += 38;
     }
     M5.Lcd.setTextDatum(TL_DATUM);
