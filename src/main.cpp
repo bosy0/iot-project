@@ -20,6 +20,7 @@
 #include "QMP6988.h"
 #include <SD.h>
 #include <SPI.h>
+#include <Adafruit_SGP30.h>
 
 // ─── Configuration réseau ─────────────────────────────────────────────────────
 #define WIFI_SSID  "Pixel 8a Marius"
@@ -55,6 +56,7 @@ TinyGPSPlus    gps;
 Adafruit_BME680 bme;
 SHT3X          sht;
 QMP6988        qmp;
+Adafruit_SGP30 sgp;
 
 WiFiClientSecure wifiClient;
 PubSubClient     mqtt(wifiClient);
@@ -68,6 +70,8 @@ struct {
     bool     gpsValid = false;
     int      battery  = 0;
     bool     charging = false;
+    uint16_t tvoc = 0, eco2 = 0;
+    bool     sgpOk = false;
 } d;
 
 // ─── État UI ─────────────────────────────────────────────────────────────────
@@ -85,6 +89,7 @@ void drawPageAir();
 void drawPageEnv();
 void drawPageGPS();
 void drawPageNet();
+void drawPageSGP();
 void setScreen(bool on);
 uint16_t qColor(float v, float good, float ok);
 void drawProgressBar(int x, int y, int w, int h, float ratio, uint16_t color);
@@ -140,6 +145,13 @@ void setup() {
     sht.begin(&Wire, SHT3X_I2C_ADDR,        21, 22);
     qmp.begin(&Wire, QMP6988_SLAVE_ADDRESS_L, 21, 22);
 
+    if (sgp.begin()) {
+        d.sgpOk = true;
+        Serial.println("SGP30 detecte");
+    } else {
+        Serial.println("SGP30 non detecte");
+    }
+
     if (!bme.begin(0x77) && !bme.begin(0x76)) {
         M5.Lcd.setTextDatum(MC_DATUM);
         M5.Lcd.setTextColor(CLR_BAD, CLR_BG);
@@ -184,12 +196,12 @@ void loop() {
     }
     if (screenOn) {
         if (M5.BtnB.wasPressed()) {
-            page = (page + 3) % 4; // page précédente
+            page = (page + 4) % 5; // bouton B // page précédente
             drawBtnBar();
             drawContent();
         }
         if (M5.BtnC.wasPressed()) {
-            page = (page + 1) % 4; // page suivante
+            page = (page + 1) % 5; // bouton C // page suivante
             drawBtnBar();
             drawContent();
         }
@@ -219,6 +231,11 @@ void loop() {
             d.pres = qmp.pressure / 100.0f; // Pa → hPa
             d.alt  = qmp.altitude;
         }
+    }
+
+    if (d.sgpOk && sgp.IAQmeasure()) {
+        d.tvoc = sgp.TVOC;
+        d.eco2 = sgp.eCO2;
     }
 
     // ── Lecture GPS — continue ────────────────────────────────────────────
@@ -274,15 +291,17 @@ void loop() {
     
     if (mqtt.connected() && (now - tMqtt >= 10000)) {
         tMqtt = now;
-        char buf[512], topic[48];
+        char buf[600], topic[48];
         snprintf(buf, sizeof(buf),
             "{\"pm1\":%d,\"pm25\":%d,\"pm10\":%d,"
             "\"voc\":%.1f,\"temp\":%.1f,\"humi\":%.1f,"
             "\"pres\":%.1f,\"alt\":%.1f,"
+            "\"tvoc\":%d,\"eco2\":%d,"
             "\"lat\":%.6f,\"lng\":%.6f,\"gps_alt\":%.1f,\"sats\":%d,"
             "\"battery\":%d,\"charging\":%s}",
             d.pm1, d.pm25, d.pm10,
             d.voc, d.temp, d.humi, d.pres, d.alt,
+            d.tvoc, d.eco2,
             d.gpsValid ? d.lat : 0.0,
             d.gpsValid ? d.lng : 0.0,
             d.gpsAlt, d.sats,
@@ -395,7 +414,7 @@ void drawBtnBar() {
     M5.Lcd.fillRect(0, BTN_Y, 320, 240 - BTN_Y, CLR_BAR);
     M5.Lcd.drawFastHLine(0, BTN_Y, 320, CLR_SEP);
 
-    const char* names[] = {"Air", "Env", "GPS", "Net"};
+    const char* names[] = {"Air", "Env", "GPS", "Net", "SGP"};
 
     // Bouton A : écran
     M5.Lcd.setTextColor(CLR_LABEL, CLR_BAR);
@@ -422,6 +441,7 @@ void drawContent() {
         case 1: drawPageEnv(); break;
         case 2: drawPageGPS(); break;
         case 3: drawPageNet(); break;
+        case 4: drawPageSGP(); break;
     }
 }
 
@@ -670,5 +690,66 @@ void drawPageNet() {
         if (i < 3) M5.Lcd.drawFastHLine(10, row_y + 38, 300, CLR_SEP);
         row_y += 38;
     }
+    M5.Lcd.setTextDatum(TL_DATUM);
+}
+
+// Page 4 — Capteur de composés organiques volatils (TVOC / eCO2 via SGP30)
+void drawPageSGP() {
+    M5.Lcd.setTextDatum(TC_DATUM);
+    M5.Lcd.setTextColor(CLR_CYAN, CLR_BG);
+    M5.Lcd.drawString("TVOC / eCO2 (SGP30)", 160, CONT_Y + 4, 2);
+
+    if (!d.sgpOk) {
+        M5.Lcd.setTextColor(CLR_BAD, CLR_BG);
+        M5.Lcd.drawString("Capteur non detecte", 160, CONT_Y + 80, 2);
+        M5.Lcd.setTextDatum(TL_DATUM);
+        return;
+    }
+
+    // ── TVOC ──────────────────────────────────────────────────────────────
+    uint16_t tvocColor = qColor((float)d.tvoc, 150, 500);
+    const char* tvocLabel = (d.tvoc < 150) ? "EXCELLENT" :
+                            (d.tvoc < 500) ? "MOYEN"    : "MAUVAIS";
+
+    char tvocBuf[20];
+    snprintf(tvocBuf, sizeof(tvocBuf), "%d ppb", d.tvoc);
+
+    int y1 = CONT_Y + 34;
+    M5.Lcd.setTextColor(CLR_LABEL, CLR_BG);
+    M5.Lcd.setTextDatum(ML_DATUM);
+    M5.Lcd.drawString("TVOC", 14, y1, 2);
+    M5.Lcd.setTextColor(tvocColor, CLR_BG);
+    M5.Lcd.setTextDatum(MR_DATUM);
+    M5.Lcd.drawString(tvocBuf, 200, y1, 4);
+    M5.Lcd.setTextDatum(MR_DATUM);
+    M5.Lcd.drawString(tvocLabel, 310, y1, 2);
+    drawProgressBar(10, y1 + 16, 300, 14, d.tvoc / 1000.0f, tvocColor);
+
+    M5.Lcd.drawFastHLine(10, CONT_Y + 78, 300, CLR_SEP);
+
+    // ── eCO2 ──────────────────────────────────────────────────────────────
+    uint16_t eco2Color = qColor((float)d.eco2, 800, 1500);
+    const char* eco2Label = (d.eco2 < 800)  ? "BON"     :
+                            (d.eco2 < 1500) ? "MOYEN"  : "MAUVAIS";
+
+    char eco2Buf[20];
+    snprintf(eco2Buf, sizeof(eco2Buf), "%d ppm", d.eco2);
+
+    int y2 = CONT_Y + 100;
+    M5.Lcd.setTextColor(CLR_LABEL, CLR_BG);
+    M5.Lcd.setTextDatum(ML_DATUM);
+    M5.Lcd.drawString("eCO2", 14, y2, 2);
+    M5.Lcd.setTextColor(eco2Color, CLR_BG);
+    M5.Lcd.setTextDatum(MR_DATUM);
+    M5.Lcd.drawString(eco2Buf, 200, y2, 4);
+    M5.Lcd.setTextDatum(MR_DATUM);
+    M5.Lcd.drawString(eco2Label, 310, y2, 2);
+    drawProgressBar(10, y2 + 16, 300, 14, d.eco2 / 3000.0f, eco2Color);
+
+    // ── Note de chauffe ───────────────────────────────────────────────────
+    M5.Lcd.setTextColor(CLR_LABEL, CLR_BG);
+    M5.Lcd.setTextDatum(TC_DATUM);
+    M5.Lcd.drawString("(15 min de chauffe pour stabilisation)", 160, CONT_Y + 155, 1);
+
     M5.Lcd.setTextDatum(TL_DATUM);
 }
