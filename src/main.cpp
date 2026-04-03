@@ -1,16 +1,6 @@
-/*
- * M5Stack Air Monitor
- *
- * Capteurs : PMS5003 (particules), BME680 (VOC), ENV III SHT3X (temp/humi),
- *            QMP6988 (pression/altitude), GPS
- * Bouton A  : allumer / éteindre l'écran
- * Bouton B  : page précédente
- * Bouton C  : page suivante
- */
-
 #include <M5Stack.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <Wire.h>
 #include <Adafruit_BME680.h>
@@ -22,34 +12,31 @@
 #include <SPI.h>
 #include <Adafruit_SGP30.h>
 
-// ─── Configuration réseau ─────────────────────────────────────────────────────
-#define WIFI_SSID  "Pixel 8a Marius"
-#define WIFI_PASS  "Mariusdup"
-#define MQTT_HOST  "632e64128d12456aa5bb05d63a8d5f49.s1.eu.hivemq.cloud"
-#define MQTT_PORT  8883
-#define MQTT_USER  "iot_project"
-#define MQTT_PASS  "7%tWH4bUoN!Y3#gg7"
+// --- Configuration ---
+#define WIFI_SSID  "insa-rasprack"
+#define WIFI_PASS  "insa-rasprack-pwd"
+#define MQTT_HOST  "192.168.50.180"
+#define MQTT_PORT  1883
 #define DEVICE_ID  "m5stack_1"
 
-// ─── Couleurs ─────────────────────────────────────────────────────────────────
-#define CLR_BG     0x0000   // Noir
-#define CLR_BAR    0x1082   // Gris très sombre (barres haut/bas)
-#define CLR_SEP    0x3186   // Gris séparateurs
-#define CLR_LABEL  0x8C71   // Gris clair (labels)
-#define CLR_GOOD   0x07E0   // Vert
-#define CLR_OK     0xFFE0   // Jaune
-#define CLR_BAD    0xF800   // Rouge
-#define CLR_CYAN   0x07FF   // Cyan (titres de section)
+IPAddress server(192, 168, 50 ,180);
 
-// ─── Dimensions de l'écran (320x240) ─────────────────────────────────────────
-#define BAR_H   28          // Hauteur barre de statut (haut)
-#define BTN_Y   216         // Y de la barre boutons (bas)
-#define CONT_Y  (BAR_H + 1) // Début zone contenu (y=29)
+// --- Couleurs & UI ---
+#define CLR_BG     0x0000
+#define CLR_BAR    0x1082
+#define CLR_SEP    0x3186
+#define CLR_LABEL  0x8C71
+#define CLR_GOOD   0x07E0
+#define CLR_OK     0xFFE0
+#define CLR_BAD    0xF800
+#define CLR_CYAN   0x07FF
+#define BAR_H   28
+#define BTN_Y   216
+#define CONT_Y  (BAR_H + 1)
 
-// ─── Objets matériel ─────────────────────────────────────────────────────────
-HardwareSerial SerialPMS(1);    // PMS5003 : UART1 RX=36 TX=26
-HardwareSerial SerialGPS(2);    // GPS     : UART2 RX=16 TX=17
-
+// --- Objets ---
+HardwareSerial SerialPMS(1);
+HardwareSerial SerialGPS(2);
 PMS            pms(SerialPMS);
 PMS::DATA      pmsData;
 TinyGPSPlus    gps;
@@ -58,10 +45,9 @@ SHT3X          sht;
 QMP6988        qmp;
 Adafruit_SGP30 sgp;
 
-WiFiClientSecure wifiClient;
+WiFiClient wifiClient;
 PubSubClient     mqtt(wifiClient);
 
-// ─── Données capteurs ─────────────────────────────────────────────────────────
 struct {
     uint16_t pm1 = 0, pm25 = 0, pm10 = 0;
     float    temp = 0, humi = 0, pres = 0, alt = 0, voc = 0;
@@ -74,14 +60,14 @@ struct {
     bool     sgpOk = false;
 } d;
 
-// ─── État UI ─────────────────────────────────────────────────────────────────
 int  page     = 0;
 bool screenOn = true;
-
-// ─── Timers (ms) ──────────────────────────────────────────────────────────────
 uint32_t tPms = 0, tBme = 0, tBat = 0, tMqtt = 0, tRecon = 0, tDisplay = 0;
+uint32_t mqttRetryDelay = 2000;
+const uint32_t maxRetryDelay = 60000;
+bool sdAvailable = false;
 
-// ─── Prototypes ───────────────────────────────────────────────────────────────
+// --- Prototypes ---
 void drawStatusBar();
 void drawBtnBar();
 void drawContent();
@@ -94,202 +80,102 @@ void setScreen(bool on);
 uint16_t qColor(float v, float good, float ok);
 void drawProgressBar(int x, int y, int w, int h, float ratio, uint16_t color);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constantes gestion connexion MQTT
-uint32_t mqttRetryDelay = 2000; // Délai initial 2s
-const uint32_t maxRetryDelay = 60000;
-
-// ─── Paramètres Carte SD ─────────────────────────────────────────────────────────
-bool sdAvailable = false;
+void callback(char *topic, byte *payload, unsigned int length) {
+    Serial.print("Message arrived: ");
+    Serial.println(topic);
+    if (strcmp(topic, "mytopic/alive") == 0) {
+    }
+}
 
 void setup() {
     M5.begin();
     M5.Power.begin();
-
-    // Silence total du haut-parleur (évite les bruits parasites DAC)
     dacWrite(25, 0);
     M5.Speaker.mute();
-
     M5.Lcd.fillScreen(CLR_BG);
     M5.Lcd.setBrightness(150);
 
-    // Initialisation de la carte SD
-    if (SD.begin()) {
-        sdAvailable = true;
-        Serial.println("Carte SD initialisée.");
-    } else {
-        Serial.println("Échec de l'initialisation de la carte SD.");
-    }
+    if (SD.begin()) sdAvailable = true;
 
-    // Écran de démarrage
-    M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.setTextColor(CLR_CYAN, CLR_BG);
-    M5.Lcd.drawString("AIR MONITOR", 160, 100, 4);
-    M5.Lcd.setTextColor(CLR_LABEL, CLR_BG);
-    M5.Lcd.drawString("Initialisation...", 160, 135, 2);
-    M5.Lcd.setTextDatum(TL_DATUM);
-
-    // Sériaux capteurs
     SerialPMS.begin(9600, SERIAL_8N1, 36, 26);
     SerialGPS.begin(9600, SERIAL_8N1, 16, 17);
     pms.passiveMode();
     pms.wakeUp();
 
-    // I2C et capteurs
     Wire.begin(21, 22);
-    sht.begin(&Wire, SHT3X_I2C_ADDR,        21, 22);
+    sht.begin(&Wire, SHT3X_I2C_ADDR, 21, 22);
     qmp.begin(&Wire, QMP6988_SLAVE_ADDRESS_L, 21, 22);
+    
+    if (sgp.begin()) d.sgpOk = true;
+    bme.begin(0x77);
 
-    if (sgp.begin()) {
-        d.sgpOk = true;
-        Serial.println("SGP30 detecte");
-    } else {
-        Serial.println("SGP30 non detecte");
-    }
-
-    if (!bme.begin(0x77) && !bme.begin(0x76)) {
-        M5.Lcd.setTextDatum(MC_DATUM);
-        M5.Lcd.setTextColor(CLR_BAD, CLR_BG);
-        M5.Lcd.drawString("BME680 non detecte", 160, 160, 2);
-        M5.Lcd.setTextDatum(TL_DATUM);
-        delay(1500);
-    }
-    bme.setTemperatureOversampling(BME680_OS_8X);
-    bme.setHumidityOversampling(BME680_OS_2X);
-    bme.setPressureOversampling(BME680_OS_4X);
-    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-    bme.setGasHeater(320, 150);
-
-    // WiFi & MQTT
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    wifiClient.setInsecure(); // TLS sans vérif. certificat (démo)
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    while(WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    mqtt.setServer(server, MQTT_PORT);
+    mqtt.setCallback(callback);
     mqtt.setKeepAlive(30);
 
-    // Batterie initiale
-    d.battery  = M5.Power.getBatteryLevel();
-    d.charging = M5.Power.isCharging();
-
-    // Affichage principal
-    M5.Lcd.fillScreen(CLR_BG);
     drawStatusBar();
     drawBtnBar();
-    drawContent();
 }
 
 void loop() {
     M5.update();
-    dacWrite(25, 0); // maintient le silence du haut-parleur
-
     uint32_t now = millis();
 
-    // ── Boutons ───────────────────────────────────────────────────────────
-    if (M5.BtnA.wasPressed()) {
-        setScreen(!screenOn);
-        return;
-    }
+    if (M5.BtnA.wasPressed()) { setScreen(!screenOn); return; }
     if (screenOn) {
-        if (M5.BtnB.wasPressed()) {
-            page = (page + 4) % 5; // bouton B // page précédente
-            drawBtnBar();
-            drawContent();
-        }
-        if (M5.BtnC.wasPressed()) {
-            page = (page + 1) % 5; // bouton C // page suivante
-            drawBtnBar();
-            drawContent();
-        }
+        if (M5.BtnB.wasPressed()) { page = (page + 4) % 5; drawBtnBar(); drawContent(); }
+        if (M5.BtnC.wasPressed()) { page = (page + 1) % 5; drawBtnBar(); drawContent(); }
     }
 
-    // ── Lecture PMS5003 — toutes les 2 secondes ───────────────────────────
-    if (now - tPms >= 2000) {
-        tPms = now;
-        pms.requestRead();
-    }
-    if (pms.read(pmsData)) {
-        d.pm1  = pmsData.PM_AE_UG_1_0;
-        d.pm25 = pmsData.PM_AE_UG_2_5;
-        d.pm10 = pmsData.PM_AE_UG_10_0;
-    }
+    // Lectures Capteurs
+    if (now - tPms >= 2000) { tPms = now; pms.requestRead(); }
+    if (pms.read(pmsData)) { d.pm1 = pmsData.PM_AE_UG_1_0; d.pm25 = pmsData.PM_AE_UG_2_5; d.pm10 = pmsData.PM_AE_UG_10_0; }
 
-    // ── Lecture BME680 + ENV III — toutes les 3 secondes ─────────────────
     if (now - tBme >= 3000) {
         tBme = now;
-        if (bme.performReading())
-            d.voc = bme.gas_resistance / 1000.0f;
-        if (sht.update()) {
-            d.temp = sht.cTemp;
-            d.humi = sht.humidity;
-        }
-        if (qmp.update()) {
-            d.pres = qmp.pressure / 100.0f; // Pa → hPa
-            d.alt  = qmp.altitude;
-        }
+        if (bme.performReading()) d.voc = bme.gas_resistance / 1000.0f;
+        if (sht.update()) { d.temp = sht.cTemp; d.humi = sht.humidity; }
+        if (qmp.update()) { d.pres = qmp.pressure / 100.0f; d.alt = qmp.altitude; }
     }
+    if (d.sgpOk && sgp.IAQmeasure()) { d.tvoc = sgp.TVOC; d.eco2 = sgp.eCO2; }
 
-    if (d.sgpOk && sgp.IAQmeasure()) {
-        d.tvoc = sgp.TVOC;
-        d.eco2 = sgp.eCO2;
-    }
-
-    // ── Lecture GPS — continue ────────────────────────────────────────────
     while (SerialGPS.available()) gps.encode(SerialGPS.read());
-    if (gps.location.isValid()) {
-        d.lat = gps.location.lat();
-        d.lng = gps.location.lng();
-        d.gpsValid = true;
-    }
-    if (gps.satellites.isValid()) d.sats   = gps.satellites.value();
-    if (gps.altitude.isValid())   d.gpsAlt = gps.altitude.meters();
+    if (gps.location.isValid()) { d.lat = gps.location.lat(); d.lng = gps.location.lng(); d.gpsValid = true; }
 
-    // ── Lecture batterie — toutes les 30 secondes ─────────────────────────
-    if (now - tBat >= 30000) {
-        tBat       = now;
-        d.battery  = M5.Power.getBatteryLevel();
-        d.charging = M5.Power.isCharging();
-    }
+    if (screenOn && now - tDisplay >= 2000) { tDisplay = now; drawStatusBar(); drawContent(); }
 
-    // ── Mise à jour affichage — toutes les 2 secondes ─────────────────────
-    if (screenOn && now - tDisplay >= 2000) {
-        tDisplay = now;
-        drawStatusBar();
-        drawContent();
-    }
-
-    // ── MQTT ──────────────────────────────────────────────────────────────
+    // --- Reconnexion MQTT ---
     if (WiFi.isConnected()) {
-
-       if (!mqtt.connected()) {
-            // On ne tente la reco que si le délai est passé
+        if (!mqtt.connected()) {
             if (now - tRecon >= mqttRetryDelay) {
                 tRecon = now;
-                Serial.println("Tentative de connexion MQTT...");
-                
-                if (mqtt.connect(DEVICE_ID, MQTT_USER, MQTT_PASS)) {
-                    Serial.println("Connecté !");
-                    mqttRetryDelay = 2000; // Reset du délai en cas de succès
+                if (mqtt.connect(DEVICE_ID)) {
+                    mqtt.subscribe("sensor/m5stack/command");
                 } else {
-                    Serial.print("Échec, code erreur : ");
-                    Serial.println(mqtt.state());
-                    // Augmentation exponentielle du délai (x2)
                     mqttRetryDelay = min(mqttRetryDelay * 2, maxRetryDelay);
                 }
             }
         } else {
-            mqtt.loop(); // Traitement des messages entrant/sortant
+            mqtt.loop();
         }
-    } else {
-        // Si le WiFi est perdu, on reset le timer de reco MQTT
-        tRecon = now;
     }
- 
+
+    // Envoi MQTT & Gestion SD
     if (now - tMqtt >= 10000) {
         tMqtt = now;
 
-        // 1. Construction du topic et du JSON
-        char buf[600], topic[48];
+        // 1. Préparation du JSON complet (Fusion Code 1 + Code 2)
+        char buf[600]; // Buffer assez large pour toutes les données
+        char topic[48];
         snprintf(topic, sizeof(topic), "sensors/%s/data", DEVICE_ID);
+        
         snprintf(buf, sizeof(buf),
             "{\"pm1\":%d,\"pm25\":%d,\"pm10\":%d,"
             "\"voc\":%.1f,\"temp\":%.1f,\"humi\":%.1f,"
@@ -308,7 +194,7 @@ void loop() {
         );
 
         if (mqtt.connected()) {
-            // 2. Vider le buffer SD si des données sont en attente
+            // 2. Vider le buffer SD s'il y a des données en retard
             if (sdAvailable && SD.exists("/buffer.txt")) {
                 File file = SD.open("/buffer.txt", FILE_READ);
                 if (file) {
@@ -317,38 +203,31 @@ void loop() {
                         line.trim();
                         if (line.length() > 0) {
                             mqtt.publish(topic, line.c_str(), true);
-                            delay(50);
+                            delay(50); 
                         }
                     }
                     file.close();
                     SD.remove("/buffer.txt");
-                    Serial.println("Buffer SD vidé.");
+                    Serial.println("Buffer SD vidé vers MQTT.");
                 }
             }
-            // 3. Envoyer la mesure live
+            
+            // 3. Envoyer la donnée actuelle
             mqtt.publish(topic, buf, true);
-            Serial.println("Donnée envoyée via MQTT.");
+            Serial.println("Données complètes envoyées via MQTT.");
 
         } else if (sdAvailable) {
-            // 4. Pas de MQTT → stocker sur SD si assez de place
-            uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
-            if (freeBytes < 10000) {
-                Serial.println("Carte SD pleine ! Donnée perdue.");
-            } else {
-                File file = SD.open("/buffer.txt", FILE_APPEND);
-                if (file) {
-                    file.println(buf);
-                    file.close();
-                    Serial.println("Donnée mise en buffer SD.");
-                } else {
-                    Serial.println("Erreur ouverture buffer.txt !");
-                }
+            // 4. Si MQTT déconnecté -> Sauvegarde sur SD
+            File file = SD.open("/buffer.txt", FILE_APPEND);
+            if (file) {
+                file.println(buf);
+                file.close();
+                Serial.println("MQTT déconnecté : donnée stockée sur SD.");
             }
         }
-
         drawStatusBar();
     }
-}    
+}
 
 // ─── Écran on/off ────────────────────────────────────────────────────────────
 void setScreen(bool on) {
