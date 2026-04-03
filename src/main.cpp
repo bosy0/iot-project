@@ -101,8 +101,6 @@ const uint32_t maxRetryDelay = 60000;
 
 // ─── Paramètres Carte SD ─────────────────────────────────────────────────────────
 bool sdAvailable = false;
-const char* bufferFile = "/buffer.json";
-
 
 void setup() {
     M5.begin();
@@ -114,9 +112,6 @@ void setup() {
 
     M5.Lcd.fillScreen(CLR_BG);
     M5.Lcd.setBrightness(150);
-
-    // Configuration MQTT (TLS sans vérification certificat pour la démo)
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
 
     // Initialisation de la carte SD
     if (SD.begin()) {
@@ -288,10 +283,13 @@ void loop() {
         // Si le WiFi est perdu, on reset le timer de reco MQTT
         tRecon = now;
     }
-    
-    if (mqtt.connected() && (now - tMqtt >= 10000)) {
+ 
+    if (now - tMqtt >= 10000) {
         tMqtt = now;
+
+        // 1. Construction du topic et du JSON
         char buf[600], topic[48];
+        snprintf(topic, sizeof(topic), "sensors/%s/data", DEVICE_ID);
         snprintf(buf, sizeof(buf),
             "{\"pm1\":%d,\"pm25\":%d,\"pm10\":%d,"
             "\"voc\":%.1f,\"temp\":%.1f,\"humi\":%.1f,"
@@ -310,7 +308,8 @@ void loop() {
         );
 
         if (mqtt.connected()) {
-            if (SD.exists("/buffer.txt")) {
+            // 2. Vider le buffer SD si des données sont en attente
+            if (sdAvailable && SD.exists("/buffer.txt")) {
                 File file = SD.open("/buffer.txt", FILE_READ);
                 if (file) {
                     while (file.available()) {
@@ -318,28 +317,38 @@ void loop() {
                         line.trim();
                         if (line.length() > 0) {
                             mqtt.publish(topic, line.c_str(), true);
-                            delay(50); // Petit délai pour laisser souffler le broker
+                            delay(50);
                         }
                     }
                     file.close();
-                    SD.remove("/buffer.txt"); // On a tout envoyé, on efface !
+                    SD.remove("/buffer.txt");
+                    Serial.println("Buffer SD vidé.");
                 }
             }
-            // 2. Envoi de la donnée en direct
-            snprintf(topic, sizeof(topic), "sensors/%s/data", DEVICE_ID);
+            // 3. Envoyer la mesure live
             mqtt.publish(topic, buf, true);
-            drawStatusBar();
+            Serial.println("Donnée envoyée via MQTT.");
+
         } else if (sdAvailable) {
-            // 3. Pas de connexion => On stocke le JSON tel quel sur la SD
-            File file = SD.open("/buffer.txt", FILE_APPEND);
-            if (file) {
-                file.println(buf); // On écrit la ligne JSON
-                file.close();
-                drawStatusBar();
+            // 4. Pas de MQTT → stocker sur SD si assez de place
+            uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
+            if (freeBytes < 10000) {
+                Serial.println("Carte SD pleine ! Donnée perdue.");
+            } else {
+                File file = SD.open("/buffer.txt", FILE_APPEND);
+                if (file) {
+                    file.println(buf);
+                    file.close();
+                    Serial.println("Donnée mise en buffer SD.");
+                } else {
+                    Serial.println("Erreur ouverture buffer.txt !");
+                }
             }
         }
+
+        drawStatusBar();
     }
-    }
+}    
 
 // ─── Écran on/off ────────────────────────────────────────────────────────────
 void setScreen(bool on) {
@@ -386,11 +395,11 @@ void drawStatusBar() {
     uint16_t sdColor = CLR_SEP; // Gris par défaut
     if (sdAvailable) {
         if (mqtt.connected()) {
-        sdColor = CLR_CYAN;
-    } else {
-        // Clignote toutes les 500ms si on écrit sur SD
-        sdColor = (millis() % 1000 < 500) ? CLR_BAD : CLR_BG;
-    }
+            sdColor = CLR_CYAN;
+        } else {
+            // Clignote toutes les 500ms si on écrit sur SD
+            sdColor = (millis() % 1000 < 500) ? CLR_BAD : CLR_BG;
+        }
     }
 
     // Titre centré
@@ -649,23 +658,27 @@ void drawPageNet() {
     // --- Ligne 3 : Carte SD ---
     netRows[2].label = "Carte SD";
     if (sdAvailable) {
-        uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-        netRows[2].value = String((unsigned long)cardSize) + " MB";
-        netRows[2].color = CLR_GOOD;
+        uint64_t freeBytes = (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024);
+        netRows[2].value = String((unsigned long)freeBytes) + " MB libres";
+        netRows[2].color = (freeBytes < 10) ? CLR_BAD : CLR_GOOD;
     } else {
         netRows[2].value = "ABSENTE";
         netRows[2].color = CLR_SEP;
     }
 
-    // --- Ligne 4 : Buffer ---
+    // --- Ligne 4 : Buffer SD ---
     netRows[3].label = "Buffer SD";
     if (sdAvailable) {
         if (SD.exists("/buffer.txt")) {
             File f = SD.open("/buffer.txt", FILE_READ);
             long sz = f.size();
             f.close();
-            netRows[3].value = String(sz / 1024) + " KB";
-            netRows[3].color = CLR_BAD; // Rouge car on accumule du retard
+            if (sz < 1024) {
+                netRows[3].value = String(sz) + " B";
+            } else {
+                netRows[3].value = String(sz / 1024) + " KB";
+            }
+            netRows[3].color = CLR_BAD; // Rouge = données en attente
         } else {
             netRows[3].value = "VIDE (OK)";
             netRows[3].color = CLR_GOOD;
